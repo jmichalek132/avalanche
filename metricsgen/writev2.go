@@ -216,3 +216,56 @@ func ToTimeSeriesSliceV2(metricFamilies []*dto.MetricFamily) ([]*writev2.TimeSer
 	}
 	return tss, st
 }
+
+// v2Series is an intermediate, non-interned representation of a single
+// remote write 2.0 series. Strings stay resolved until request assembly,
+// where they are interned into a symbol table scoped to one request.
+// Later increments add metadata, histograms, exemplars and created
+// timestamps here.
+type v2Series struct {
+	labels    []string // flat name/value pairs, sorted by label name
+	value     float64
+	timestamp int64 // epoch milliseconds
+}
+
+// flatLabels converts a metric's labels plus __name__ into the flat,
+// sorted name/value pair form SymbolsTable.SymbolizeLabels expects.
+func flatLabels(name string, label []*dto.LabelPair) []string {
+	lbls := prompbLabels(name, label)
+	flat := make([]string, 0, len(lbls)*2)
+	for _, l := range lbls {
+		flat = append(flat, l.Name, l.Value)
+	}
+	return flat
+}
+
+// toV2Series converts gathered metric families into the intermediate
+// series model. Only counters and gauges are implemented so far.
+func toV2Series(metricFamilies []*dto.MetricFamily) []*v2Series {
+	timestamp := time.Now().UnixMilli()
+	series := make([]*v2Series, 0, len(metricFamilies)*10)
+
+	skippedSamples := 0
+	for _, metricFamily := range metricFamilies {
+		for _, metric := range metricFamily.Metric {
+			s := &v2Series{
+				labels:    flatLabels(*metricFamily.Name, metric.Label),
+				timestamp: timestamp,
+			}
+			switch *metricFamily.Type {
+			case dto.MetricType_COUNTER:
+				s.value = *metric.Counter.Value
+			case dto.MetricType_GAUGE:
+				s.value = *metric.Gauge.Value
+			default:
+				skippedSamples++
+				continue
+			}
+			series = append(series, s)
+		}
+	}
+	if skippedSamples > 0 {
+		log.Printf("WARN: Skipping %v samples; sending only %v samples, given only gauge and counters are currently implemented\n", skippedSamples, len(series))
+	}
+	return series
+}
