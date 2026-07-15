@@ -1,5 +1,7 @@
 ## unreleased
 
+* [CHANGE] Remote write v2: each request now carries a request-scoped symbol table instead of the full table; the summary log includes receiver-confirmed written counts.
+
 ## 0.7.0 / 2025-01-14
 
 * [CHANGE] (breaking) Removed the deprecated `--metric-count` flag (use `--gauge-metric-count` instead). #119
