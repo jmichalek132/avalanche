@@ -269,3 +269,24 @@ func toV2Series(metricFamilies []*dto.MetricFamily) []*v2Series {
 	}
 	return series
 }
+
+// buildV2Request assembles one remote write 2.0 request, interning every
+// string into a symbol table scoped to this request only, as real senders
+// do (the receiver deduplicates per request).
+func buildV2Request(series []*v2Series) *writev2.Request {
+	st := writev2.NewSymbolTable()
+	tss := make([]*writev2.TimeSeries, 0, len(series))
+	for _, s := range series {
+		tss = append(tss, &writev2.TimeSeries{
+			LabelsRefs: st.SymbolizeLabels(s.labels, nil),
+			Samples: []*writev2.Sample{{
+				Value:     s.value,
+				Timestamp: s.timestamp,
+			}},
+		})
+	}
+	return &writev2.Request{
+		Symbols:    st.Symbols(),
+		Timeseries: tss,
+	}
+}
