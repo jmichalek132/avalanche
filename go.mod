@@ -4,6 +4,7 @@ go 1.25.0
 
 require (
 	github.com/google/go-cmp v0.7.0
+	github.com/klauspost/compress v1.19.0
 	github.com/nelkinda/health-go v0.0.1
 	github.com/oklog/run v1.2.0
 	github.com/prometheus/client_golang v1.23.2
@@ -23,7 +24,6 @@ require (
 	github.com/davecgh/go-spew v1.1.2-0.20180830191138-d8f796af33cc // indirect
 	github.com/gogo/protobuf v1.3.2 // indirect
 	github.com/grafana/regexp v0.0.0-20250905093917-f7b3be9d1853 // indirect
-	github.com/klauspost/compress v1.19.0 // indirect
 	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
 	github.com/nelkinda/http-go v0.0.1 // indirect
 	github.com/pmezard/go-difflib v1.0.1-0.20181226105442-5d4384ee4fb2 // indirect

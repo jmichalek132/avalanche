@@ -25,7 +25,6 @@ import (
 	writev2 "github.com/prometheus/client_golang/exp/api/remote/genproto/v2"
 	"github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
-	"github.com/prometheus/common/model"
 )
 
 func (w *Writer) writeV2(ctx context.Context) error {
@@ -36,15 +35,16 @@ func (w *Writer) writeV2(ctx context.Context) error {
 		return ctx.Err()
 	}
 
-	tss, st, err := collectMetricsV2(w.gatherer, w.config.OutOfOrder)
+	series, err := collectMetricsV2(w.gatherer, w.config.OutOfOrder)
 	if err != nil {
 		return err
 	}
 
 	var (
 		totalTime       time.Duration
-		totalSamplesExp = len(tss) * w.config.RequestCount
+		totalSamplesExp = len(series) * w.config.RequestCount
 		totalSamplesAct int
+		stats           remote.WriteResponseStats
 		mtx             sync.Mutex
 		wgMetrics       sync.WaitGroup
 		merr            []error
@@ -53,10 +53,10 @@ func (w *Writer) writeV2(ctx context.Context) error {
 	shouldRunForever := w.config.RequestCount == -1
 	if shouldRunForever {
 		log.Printf("Sending: %v timeseries infinitely, %v timeseries per request, %v delay between requests\n",
-			len(tss), w.config.BatchSize, w.config.RequestInterval)
+			len(series), w.config.BatchSize, w.config.RequestInterval)
 	} else {
 		log.Printf("Sending: %v timeseries, %v times, %v timeseries per request, %v delay between requests\n",
-			len(tss), w.config.RequestCount, w.config.BatchSize, w.config.RequestInterval)
+			len(series), w.config.RequestCount, w.config.BatchSize, w.config.RequestInterval)
 	}
 
 	ticker := time.NewTicker(w.config.RequestInterval)
@@ -80,16 +80,18 @@ func (w *Writer) writeV2(ctx context.Context) error {
 		select {
 		case <-w.config.UpdateNotify:
 			log.Println("updating remote write metrics")
-			tss, st, err = collectMetricsV2(w.gatherer, w.config.OutOfOrder)
+			series, err = collectMetricsV2(w.gatherer, w.config.OutOfOrder)
 			if err != nil {
+				mtx.Lock()
 				merr = append(merr, err)
+				mtx.Unlock()
 			}
 		default:
-			tss = updateTimestampsV2(tss)
+			updateTimestampsV2(series)
 		}
 
 		start := time.Now()
-		for i := 0; i < len(tss); i += w.config.BatchSize {
+		for i := 0; i < len(series); i += w.config.BatchSize {
 			wgMetrics.Add(1)
 			concurrencyLimitCh <- struct{}{}
 			go func(i int) {
@@ -98,22 +100,23 @@ func (w *Writer) writeV2(ctx context.Context) error {
 				}()
 				defer wgMetrics.Done()
 				end := i + w.config.BatchSize
-				if end > len(tss) {
-					end = len(tss)
+				if end > len(series) {
+					end = len(series)
 				}
-				req := &writev2.Request{
-					Timeseries: tss[i:end],
-					Symbols:    st.Symbols(), // We pass full symbols table to each request for now
-				}
+				req := buildV2Request(series[i:end])
 
-				if _, err := w.remoteAPI.Write(ctx, remote.WriteV2MessageType, req); err != nil {
+				st, err := w.remoteAPI.Write(ctx, remote.WriteV2MessageType, req)
+				if err != nil {
+					mtx.Lock()
 					merr = append(merr, err)
+					mtx.Unlock()
 					w.logger.Error("error writing metrics", "error", err)
 					return
 				}
 
 				mtx.Lock()
-				totalSamplesAct += len(tss[i:end])
+				totalSamplesAct += len(req.Timeseries)
+				stats.Add(st)
 				mtx.Unlock()
 			}(i)
 		}
@@ -124,13 +127,16 @@ func (w *Writer) writeV2(ctx context.Context) error {
 			return errors.Join(merr...)
 		}
 	}
-	if w.config.RequestCount*len(tss) != totalSamplesAct {
+	if w.config.RequestCount*len(series) != totalSamplesAct {
 		merr = append(merr, fmt.Errorf("total samples mismatch, exp:%v , act:%v", totalSamplesExp, totalSamplesAct))
 	}
 	w.logger.Info("metrics summary",
 		"total_time", totalTime.Round(time.Second),
 		"total_samples", totalSamplesAct,
 		"samples_per_sec", int(float64(totalSamplesAct)/totalTime.Seconds()),
+		"written_samples", stats.Samples,
+		"written_histograms", stats.Histograms,
+		"written_exemplars", stats.Exemplars,
 		"errors", countErrors(merr))
 	return errors.Join(merr...)
 }
@@ -145,76 +151,31 @@ func countErrors(merr []error) int {
 	return count
 }
 
-func updateTimestampsV2(tss []*writev2.TimeSeries) []*writev2.TimeSeries {
+func updateTimestampsV2(series []*v2Series) {
 	now := time.Now().UnixMilli()
-	for i := range tss {
-		tss[i].Samples[0].Timestamp = now
+	for _, s := range series {
+		s.timestamp = now
 	}
-	return tss
 }
 
-func shuffleTimestampsV2(tss []*writev2.TimeSeries) []*writev2.TimeSeries {
+func shuffleTimestampsV2(series []*v2Series) {
 	now := time.Now().UnixMilli()
 	offsets := []int64{0, -60 * 1000, -5 * 60 * 1000}
-	for i := range tss {
-		offset := offsets[i%len(offsets)]
-		tss[i].Samples[0].Timestamp = now + offset
+	for i, s := range series {
+		s.timestamp = now + offsets[i%len(offsets)]
 	}
-	return tss
 }
 
-func collectMetricsV2(gatherer prometheus.Gatherer, outOfOrder bool) ([]*writev2.TimeSeries, writev2.SymbolsTable, error) {
+func collectMetricsV2(gatherer prometheus.Gatherer, outOfOrder bool) ([]*v2Series, error) {
 	metricFamilies, err := gatherer.Gather()
 	if err != nil {
-		return nil, writev2.SymbolsTable{}, err
+		return nil, err
 	}
-	tss, st := ToTimeSeriesSliceV2(metricFamilies)
+	series := toV2Series(metricFamilies)
 	if outOfOrder {
-		tss = shuffleTimestampsV2(tss)
+		shuffleTimestampsV2(series)
 	}
-	return tss, st, nil
-}
-
-// ToTimeSeriesSliceV2 converts a slice of metricFamilies containing samples into a slice of writev2.TimeSeries.
-func ToTimeSeriesSliceV2(metricFamilies []*dto.MetricFamily) ([]*writev2.TimeSeries, writev2.SymbolsTable) {
-	st := writev2.NewSymbolTable()
-	timestamp := int64(model.Now())
-	tss := make([]*writev2.TimeSeries, 0, len(metricFamilies)*10)
-
-	skippedSamples := 0
-	for _, metricFamily := range metricFamilies {
-		for _, metric := range metricFamily.Metric {
-			labels := prompbLabels(*metricFamily.Name, metric.Label)
-			labelRefs := make([]uint32, 0, len(labels))
-			for _, label := range labels {
-				labelRefs = append(labelRefs, st.Symbolize(label.Name))
-				labelRefs = append(labelRefs, st.Symbolize(label.Value))
-			}
-			ts := &writev2.TimeSeries{
-				LabelsRefs: labelRefs,
-			}
-			switch *metricFamily.Type {
-			case dto.MetricType_COUNTER:
-				ts.Samples = []*writev2.Sample{{
-					Value:     *metric.Counter.Value,
-					Timestamp: timestamp,
-				}}
-				tss = append(tss, ts)
-			case dto.MetricType_GAUGE:
-				ts.Samples = []*writev2.Sample{{
-					Value:     *metric.Gauge.Value,
-					Timestamp: timestamp,
-				}}
-				tss = append(tss, ts)
-			default:
-				skippedSamples++
-			}
-		}
-	}
-	if skippedSamples > 0 {
-		log.Printf("WARN: Skipping %v samples; sending only %v samples, given only gauge and counters are currently implemented\n", skippedSamples, len(tss))
-	}
-	return tss, st
+	return series, nil
 }
 
 // v2Series is an intermediate, non-interned representation of a single

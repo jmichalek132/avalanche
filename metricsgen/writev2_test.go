@@ -14,9 +14,22 @@
 package metricsgen
 
 import (
+	"bytes"
+	"context"
+	"fmt"
+	"io"
+	"log/slog"
+	"net/http"
+	"net/http/httptest"
+	"strconv"
+	"sync"
 	"testing"
+	"time"
 
+	"github.com/klauspost/compress/snappy"
+	"github.com/prometheus/client_golang/exp/api/remote"
 	writev2 "github.com/prometheus/client_golang/exp/api/remote/genproto/v2"
+	"github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
 	"github.com/stretchr/testify/require"
 )
@@ -114,4 +127,123 @@ func TestBuildV2RequestScopedPerBatch(t *testing.T) {
 	require.NotContains(t, reqA.Symbols, "only_in_b")
 	require.Contains(t, reqB.Symbols, "only_in_b")
 	require.NotContains(t, reqB.Symbols, "only_in_a")
+}
+
+func TestShuffleTimestampsV2(t *testing.T) {
+	series := []*v2Series{{}, {}, {}}
+	before := time.Now().UnixMilli()
+
+	shuffleTimestampsV2(series)
+
+	offsets := []int64{0, -60 * 1000, -5 * 60 * 1000}
+	for i, s := range series {
+		// Offsets are assigned round-robin by index.
+		require.InDelta(t, offsets[i%len(offsets)], s.timestamp-before, 1000, "series %d", i)
+	}
+
+	outOfOrder := false
+	for i := 1; i < len(series); i++ {
+		if series[i].timestamp < series[i-1].timestamp {
+			outOfOrder = true
+		}
+	}
+	require.True(t, outOfOrder, "timestamps are not out of order")
+}
+
+func TestWriteV2EndToEnd(t *testing.T) {
+	var (
+		mtx      sync.Mutex
+		captured []*writev2.Request
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("read body: %v", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		raw, err := snappy.Decode(nil, body)
+		if err != nil {
+			t.Errorf("snappy decode: %v", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		req := &writev2.Request{}
+		if err := req.UnmarshalVT(raw); err != nil {
+			t.Errorf("unmarshal: %v", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+
+		mtx.Lock()
+		captured = append(captured, req)
+		mtx.Unlock()
+
+		w.Header().Set("X-Prometheus-Remote-Write-Samples-Written", strconv.Itoa(len(req.Timeseries)))
+		w.Header().Set("X-Prometheus-Remote-Write-Histograms-Written", "0")
+		w.Header().Set("X-Prometheus-Remote-Write-Exemplars-Written", "0")
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	t.Cleanup(srv.Close)
+
+	reg := prometheus.NewRegistry()
+	for i := 0; i < 4; i++ {
+		g := prometheus.NewGauge(prometheus.GaugeOpts{Name: fmt.Sprintf("test_gauge_%d", i)})
+		g.Set(float64(i))
+		reg.MustRegister(g)
+	}
+
+	api, err := remote.NewAPI(srv.URL, remote.WithAPIHTTPClient(srv.Client()))
+	require.NoError(t, err)
+
+	updateNotify := make(chan struct{}, 1)
+	updateNotify <- struct{}{}
+
+	const requestCount = 3
+	var logBuf bytes.Buffer
+	writer := &Writer{
+		logger: slog.New(slog.NewTextHandler(&logBuf, nil)),
+		config: &ConfigWrite{
+			RequestInterval: 10 * time.Millisecond,
+			BatchSize:       2,
+			RequestCount:    requestCount,
+			UpdateNotify:    updateNotify,
+			Concurrency:     2,
+		},
+		gatherer:  reg,
+		remoteAPI: api,
+	}
+
+	require.NoError(t, writer.writeV2(context.Background()))
+
+	// Receiver-confirmed stats accumulated across all requests:
+	// requestCount ticks x 4 series = 12 written samples.
+	require.Contains(t, logBuf.String(), "written_samples=12")
+
+	mtx.Lock()
+	defer mtx.Unlock()
+	// 4 series / batch size 2 = 2 requests per tick, requestCount ticks.
+	require.Len(t, captured, requestCount*2)
+
+	allTimestamps := map[int64]bool{}
+	for _, req := range captured {
+		require.Len(t, req.Timeseries, 2)
+		require.NotEmpty(t, req.Symbols)
+		require.Equal(t, "", req.Symbols[0])
+
+		reqTimestamps := map[int64]bool{}
+		for _, ts := range req.Timeseries {
+			for _, ref := range ts.LabelsRefs {
+				require.Less(t, int(ref), len(req.Symbols))
+			}
+			labels := writev2.DesymbolizeLabels(ts.LabelsRefs, req.Symbols, nil)
+			require.Equal(t, "__name__", labels[0])
+
+			require.Len(t, ts.Samples, 1)
+			reqTimestamps[ts.Samples[0].Timestamp] = true
+			allTimestamps[ts.Samples[0].Timestamp] = true
+		}
+		require.Len(t, reqTimestamps, 1, "all samples in one request share the tick timestamp")
+	}
+	require.GreaterOrEqual(t, len(allTimestamps), 2, "timestamps advance across ticks")
 }
